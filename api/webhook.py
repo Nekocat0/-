@@ -11,7 +11,7 @@ SECRET_TOKEN = os.environ.get('GITHUB_WEBHOOK_SECRET')
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
-# "格式净化器"，用于处理要用MarkdownV2发送的文本
+# "格式净化器"，我们只对需要的文本使用它
 def escape_markdown(text):
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return ''.join(f'\\{char}' if char in escape_chars else char for char in str(text))
@@ -39,11 +39,14 @@ class handler(BaseHTTPRequestHandler):
             data = json.loads(body)
 
             if data.get('action') == 'published':
-                # --- 第一步：发送带格式的文本通知 (保持不变) ---
+                # --- 第一步：发送带格式的文本通知 ---
+                
+                # ✨✨✨ 关键修正：只对需要的文本进行转义 ✨✨✨
                 repo_name = escape_markdown(data['repository']['full_name'])
                 release_tag = escape_markdown(data['release']['tag_name'])
                 release_name = escape_markdown(data['release']['name'] or 'N/A')
                 releaser_name = escape_markdown(data['sender']['login'])
+                # 【最重要】URL 保持原样，绝不转义！
                 release_url = data['release']['html_url']
 
                 message = (
@@ -55,7 +58,7 @@ class handler(BaseHTTPRequestHandler):
                 )
                 self.send_telegram_message(message)
 
-                # --- 第二步：发送没有任何描述的附件 ---
+                # --- 第二步：发送没有任何描述的附件 (遵从主人之前的决定) ---
                 assets = data['release'].get('assets', [])
                 if assets:
                     for asset in assets:
@@ -65,7 +68,6 @@ class handler(BaseHTTPRequestHandler):
                             print(f"Found matching asset: {file_name}")
                             file_url = asset['browser_download_url']
                             
-                            # ✨✨✨ 核心改动：不再创建caption，直接发送文件 ✨✨✨
                             if asset['size'] > 50 * 1024 * 1024:
                                 self.send_telegram_message(f"🥺 文件 `{escape_markdown(file_name)}` 太大了（超过50MB），无法直接推送，请主人手动下载哦。")
                                 continue
@@ -83,7 +85,6 @@ class handler(BaseHTTPRequestHandler):
             self.send_error(500, "Internal Server Error")
 
     def send_telegram_message(self, text):
-        """发送带MarkdownV2格式的文本消息"""
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         payload = {'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'MarkdownV2'}
         try:
@@ -92,12 +93,11 @@ class handler(BaseHTTPRequestHandler):
             print("Telegram formatted text message sent successfully!")
         except requests.exceptions.RequestException as e:
             print(f"Failed to send Telegram message: {e}")
+            # 打印出失败时发送的具体内容，方便调试
+            print(f"Failing payload: {payload}")
 
     def send_telegram_document(self, document_url):
-        # ✨✨✨ 核心改动：函数不再接收caption参数 ✨✨✨
-        """发送文件，不带任何说明"""
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
-        # ✨✨✨ 核心改动：payload里不再有caption ✨✨✨
         payload = {'chat_id': CHAT_ID, 'document': document_url}
         try:
             response = requests.post(url, json=payload, timeout=60)

@@ -7,5 +7,5 @@
 ## 主要内容
 将[oppo_oneplus_realme_sm8650](https://github.com/Nekocat0/oppo_oplus_realme_sm8650)推送至Telegram
 
-## 注意⚠️
-脚本内容均使用Gemini 2.5Pro和DeepSeek R1生成，仅限于本人使用。
+## ⚠️注意
+脚本内容均使用Gemini 2.5Pro和DeepSeek R1生成，且仅限于本人使用。

@@ -4,10 +4,9 @@ import json
 import hmac
 import hashlib
 import os
-import requests # 用来发消息的工具
+import requests
 
 # 从 Vercel 的环境变量里安全地取出我们的秘密信息
-# 这样就不会把 Token 直接写在代码里，非常安全！
 SECRET_TOKEN = os.environ.get('GITHUB_WEBHOOK_SECRET')
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
@@ -15,39 +14,34 @@ CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 # 这是我们处理请求的核心类
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        # --- 第一关：安全检查！---
-        # 确保是 GitHub 官方发来的请求，而不是坏人伪造的
+        # --- 安全检查部分 (保持不变) ---
         signature_header = self.headers.get('X-Hub-Signature-256')
         if not signature_header:
             self.send_error(403, "Missing signature")
             return
-
-        # 读取请求的内容
+        
         content_length = int(self.headers['Content-Length'])
         body = self.rfile.read(content_length)
-
-        # 用我们预设的 Secret Token 计算一个签名
+        
         expected_signature = 'sha256=' + hmac.new(SECRET_TOKEN.encode(), body, hashlib.sha256).hexdigest()
-
-        # 对比 GitHub 发来的签名和我们自己计算的是否一致
+        
         if not hmac.compare_digest(signature_header, expected_signature):
             self.send_error(403, "Invalid signature")
             return
 
-        # --- 第二关：解析数据 & 发送通知 ---
+        # --- 解析数据 & 发送通知 ---
         try:
             data = json.loads(body)
 
-            # 我们只关心“新版本发布(published)”这个动作
             if data.get('action') == 'published':
-                # 从数据中提取我们需要的信息
+                # 提取信息
                 repo_name = data['repository']['full_name']
                 release_tag = data['release']['tag_name']
-                release_name = data['release']['name']
+                release_name = data['release']['name'] or 'N/A'
                 release_url = data['release']['html_url']
                 releaser_name = data['sender']['login']
 
-                # 拼接一条可爱的通知消息！(主人可以随意修改这里的格式)
+                # 构造并发送文本消息 (这部分不变)
                 message = (
                     f"🔔 **叮咚！主人，项目有新动态啦！**\n\n"
                     f"🐾 **仓库:** `{repo_name}`\n"
@@ -55,31 +49,67 @@ class handler(BaseHTTPRequestHandler):
                     f"👤 **发布者:** {releaser_name}\n\n"
                     f"快去看看有什么新内容吧：\n[点我直达]({release_url})"
                 )
-
-                # 调用函数，把消息发送到 Telegram
                 self.send_telegram_message(message)
 
-            # 告诉 GitHub：“我收到啦，处理得很成功！”
+                # 检查并发送附件
+                assets = data['release'].get('assets', [])
+                if assets:
+                    print(f"Found {len(assets)} assets. Checking for 'Anykernel3'...")
+                    for asset in assets:
+                        file_name = asset['name']
+                        
+                        # ✨✨✨ 重点在这里！添加文件名检查守卫 ✨✨✨
+                        if 'AnyKernel3' in file_name:
+                            print(f"Found matching asset: {file_name}")
+                            file_url = asset['browser_download_url']
+                            file_size_mb = asset['size'] / (1024 * 1024)
+                            caption = (
+                                f"📄 **附件:** `{file_name}`\n"
+                                f"📦 **大小:** `{file_size_mb:.2f} MB`\n"
+                                f"🔑 **类型:** `Anykernel3`"
+                            )
+                            
+                            # 检查文件大小
+                            if asset['size'] > 50 * 1024 * 1024:
+                                print(f"Skipping asset {file_name} due to size limit.")
+                                self.send_telegram_message(f"🥺 文件 `{file_name}` 太大了（超过50MB），无法直接推送，请主人手动下载哦。")
+                                continue
+
+                            # 发送文件
+                            self.send_telegram_document(file_url, caption)
+                        else:
+                            # 如果文件名不匹配，就在日志里说一声，然后跳过
+                            print(f"Skipping asset: {file_name} (does not contain 'Anykernel3')")
+
+                else:
+                    print("No assets found in this release.")
+
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b'OK')
 
         except Exception as e:
-            # 如果中间出了任何问题，记录下来并告诉 GitHub 处理失败
             print(f"Error: {e}")
             self.send_error(500, "Internal Server Error")
 
     def send_telegram_message(self, text):
-        """专门负责发送消息到 Telegram 的函数"""
+        # (此函数保持不变)
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {
-            'chat_id': CHAT_ID,
-            'text': text,
-            'parse_mode': 'Markdown' # 让消息支持加粗、链接等格式
-        }
+        payload = {'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'Markdown'}
         try:
             response = requests.post(url, json=payload)
-            response.raise_for_status() # 如果发送失败会报错
-            print("Telegram notification sent successfully!")
+            response.raise_for_status()
+            print("Telegram text message sent successfully!")
         except requests.exceptions.RequestException as e:
             print(f"Failed to send Telegram message: {e}")
+
+    def send_telegram_document(self, document_url, caption):
+        # (此函数保持不变)
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+        payload = {'chat_id': CHAT_ID, 'document': document_url, 'caption': caption, 'parse_mode': 'Markdown'}
+        try:
+            response = requests.post(url, json=payload)
+            response.raise_for_status()
+            print(f"Telegram document sent successfully: {document_url}")
+        except requests.exceptions.RequestException as e:
+            print(f"Failed to send Telegram document: {e}")

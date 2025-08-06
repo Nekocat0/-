@@ -19,6 +19,7 @@ if not (SECRET_TOKEN and BOT_TOKEN and CHAT_ID):
 MAX_CONTENT_LENGTH = 1024 * 1024  # 1MB
 ANY_KERNEL_PATTERN = re.compile(r'any[\s_-]?kernel3?', re.IGNORECASE)
 TELEGRAM_API_DELAY = 1  # 文件发送间隔(秒)
+TELEGRAM_MAX_MESSAGE_LENGTH = 4000  # Telegram消息最大长度
 
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -63,16 +64,18 @@ class handler(BaseHTTPRequestHandler):
                 
                 print(f"📦 收到Release事件: {repo['full_name']} v{release['tag_name']}")
 
-                # 发送基础通知
-                message = (
+                # 构建完整的基础通知消息（无字数限制）
+                base_message = (
                     f"🔔 **新版本发布通知**\n\n"
                     f"📦 仓库: [{repo['full_name']}]({repo['html_url']})\n"
                     f"🏷 版本: [{release['tag_name']}]({release['html_url']}) - {release.get('name', '')}\n"
                     f"👤 发布者: [{sender['login']}]({sender['html_url']})\n"
                     f"📅 发布时间: {release['published_at']}\n\n"
-                    f"{release.get('body', '')[:300]}..."
+                    f"{release.get('body', '')}"  # 移除字数限制
                 )
-                self.send_telegram_message(message)
+                
+                # 智能处理超长消息
+                self.send_telegram_message_safe(base_message)
                 
                 # 处理附件
                 anykernel_assets = [
@@ -114,7 +117,7 @@ class handler(BaseHTTPRequestHandler):
                             f"- [`{self.safe_markdown(f['name'])}`]({f['browser_download_url']})"
                             for f in large_files
                         )
-                        self.send_telegram_message(large_files_msg)
+                        self.send_telegram_message_safe(large_files_msg)
 
             self.send_response(200)
             self.end_headers()
@@ -124,6 +127,46 @@ class handler(BaseHTTPRequestHandler):
             print(f"❌ 处理错误: {str(e)}")
             traceback.print_exc()
             self.send_error(500, f"服务器内部错误: {str(e)}")
+    
+    def send_telegram_message_safe(self, text):
+        """智能处理超长消息的分段发送"""
+        # 如果消息长度在Telegram限制内，直接发送
+        if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
+            return self.send_telegram_message(text)
+        
+        print(f"⚠️ 消息过长({len(text)}字符)，将分段发送...")
+        
+        # 分段发送策略
+        messages = []
+        current_message = ""
+        
+        # 按行分割保持段落结构
+        for line in text.split('\n'):
+            # 如果当前行加入后不超过限制，添加该行
+            if len(current_message) + len(line) + 1 <= TELEGRAM_MAX_MESSAGE_LENGTH:
+                current_message += line + "\n"
+            else:
+                # 保存当前消息段
+                if current_message:
+                    messages.append(current_message.strip())
+                
+                # 如果单行就超过限制，进行强制分割
+                if len(line) > TELEGRAM_MAX_MESSAGE_LENGTH:
+                    chunks = [line[i:i+TELEGRAM_MAX_MESSAGE_LENGTH] for i in range(0, len(line), TELEGRAM_MAX_MESSAGE_LENGTH)]
+                    messages.extend(chunks)
+                    current_message = ""
+                else:
+                    current_message = line + "\n"
+        
+        # 添加最后一段
+        if current_message.strip():
+            messages.append(current_message.strip())
+        
+        # 发送所有分段
+        for i, msg in enumerate(messages):
+            prefix = f"📄 消息分段 ({i+1}/{len(messages)})\n\n" if len(messages) > 1 else ""
+            self.send_telegram_message(prefix + msg)
+            time.sleep(0.5)  # 短暂延迟避免速率限制
 
     def safe_markdown(self, text):
         """安全处理Markdown特殊字符"""
@@ -146,7 +189,7 @@ class handler(BaseHTTPRequestHandler):
         try:
             response = requests.post(url, json=payload, timeout=10)
             response.raise_for_status()
-            print("✅ 消息发送成功")
+            print(f"✅ 消息发送成功 ({len(text)}字符)")
             return True
         except requests.exceptions.RequestException as e:
             print(f"❌ 消息发送失败: {str(e)}")

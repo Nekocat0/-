@@ -53,7 +53,7 @@ class handler(BaseHTTPRequestHandler):
                 message = (
                     f"🔔 *叮咚！主人，项目有新动态啦！*\n\n"
                     f"🐾 *仓库:* `{repo_name}`\n"
-                    f"✨ *版本:* `{release_tag}` \- {release_name}\n"
+                    f"✨ *版本:* `{release_tag}` - {release_name}\n"
                     f"👤 *发布者:* {releaser_name}\n\n"
                     f"快去看看有什么新内容吧：\n[点我直达]({release_url})"
                 )

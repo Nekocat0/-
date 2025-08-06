@@ -1,4 +1,4 @@
-# 导入我们需要的魔法工具
+# 导入我们需要的工具
 from http.server import BaseHTTPRequestHandler
 import json
 import hmac
@@ -14,7 +14,7 @@ CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 # 这是我们处理请求的核心类
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        # --- 安全检查部分 (保持不变) ---
+        # --- 安全检查部分 ---
         signature_header = self.headers.get('X-Hub-Signature-256')
         if not signature_header:
             self.send_error(403, "Missing signature")
@@ -41,7 +41,7 @@ class handler(BaseHTTPRequestHandler):
                 release_url = data['release']['html_url']
                 releaser_name = data['sender']['login']
 
-                # 构造并发送文本消息 (这部分不变)
+                # 构造并发送文本消息
                 message = (
                     f"🔔 **叮咚！主人，项目有新动态啦！**\n\n"
                     f"🐾 **仓库:** `{repo_name}`\n"
@@ -59,7 +59,7 @@ class handler(BaseHTTPRequestHandler):
                         file_name = asset['name']
                         
                         # ✨✨✨ 重点在这里！添加文件名检查守卫 ✨✨✨
-                        if 'AnyKernel3' in file_name:
+                        if 'anykernel3' in file_name.lower():
                             print(f"Found matching asset: {file_name}")
                             file_url = asset['browser_download_url']
                             file_size_mb = asset['size'] / (1024 * 1024)

@@ -1,1 +1,1 @@
-一个依赖#Vercel部署的自动推送Release至Telegram的自动化脚本
+一个依赖Vercel部署的自动推送Release至Telegram的自动化脚本

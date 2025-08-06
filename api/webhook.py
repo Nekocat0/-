@@ -6,6 +6,7 @@ import os
 import requests
 import re
 import threading
+import traceback  # 添加堆栈跟踪
 
 # 严格的环境变量检查
 SECRET_TOKEN = os.environ.get('GITHUB_WEBHOOK_SECRET')
@@ -20,10 +21,14 @@ ANY_KERNEL_PATTERN = re.compile(r'any[\s_-]?kernel3?', re.IGNORECASE)
 
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        # 精确路径验证
-        if self.path != "/webhook":
-            self.send_error(404, "路径无效")
+        # ========== 修复路径验证 ========== #
+        # 允许 /api/webhook 和 /webhook 两种路径
+        valid_paths = ["/api/webhook", "/webhook"]
+        if self.path not in valid_paths:
+            self.send_error(404, f"路径无效: {self.path}。期望路径: {', '.join(valid_paths)}")
+            print(f"❌ 无效路径请求: {self.path}")
             return
+        # ================================ #
         
         # 安全签名验证
         signature_header = self.headers.get('X-Hub-Signature-256')
@@ -114,15 +119,16 @@ class handler(BaseHTTPRequestHandler):
             self.wfile.write(b'OK')
 
         except Exception as e:
+            # 添加详细错误日志
             print(f"❌ 处理错误: {str(e)}")
-            self.send_error(500, "服务器内部错误")
+            traceback.print_exc()  # 打印完整堆栈跟踪
+            self.send_error(500, f"服务器内部错误: {str(e)}")
 
     def safe_markdown(self, text):
         """确保文本安全嵌入Markdown"""
-        # 替换破坏性字符但保留描述性字符
         return (
-            text.replace('`', "'")  # 反引号变单引号
-                .replace('*', '×')   # 星号变乘号
+            text.replace('`', "'")
+                .replace('*', '×')
         )
     
     def send_telegram_message(self, text):
@@ -151,7 +157,7 @@ class handler(BaseHTTPRequestHandler):
         
         # 安全处理特殊字符
         safe_name = self.safe_markdown(file_name)
-        caption = f"`{safe_name}`"  # Markdown代码块显示
+        caption = f"`{safe_name}`"
         
         payload = {
             'chat_id': CHAT_ID,
@@ -171,7 +177,7 @@ class handler(BaseHTTPRequestHandler):
             if hasattr(e, 'response') and e.response:
                 print(f"📄 API响应: {e.response.status_code} {e.response.text}")
                 
-            # 优雅降级：发送下载链接
+            # 优雅降级
             fallback_msg = (
                 f"⚠️ 文件上传失败，请手动下载:\n"
                 f"`{safe_name}`\n"

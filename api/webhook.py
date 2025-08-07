@@ -64,18 +64,16 @@ class handler(BaseHTTPRequestHandler):
                 
                 print(f"📦 收到Release事件: {repo['full_name']} v{release['tag_name']}")
 
-                # 构建完整的基础通知消息（无字数限制）
-                base_message = (
+                # 发送基础通知
+                message = (
                     f"🔔 **新版本发布通知**\n\n"
                     f"📦 仓库: [{repo['full_name']}]({repo['html_url']})\n"
                     f"🏷 版本: [{release['tag_name']}]({release['html_url']}) - {release.get('name', '')}\n"
                     f"👤 发布者: [{sender['login']}]({sender['html_url']})\n"
                     f"📅 发布时间: {release['published_at']}\n\n"
-                    f"{release.get('body', '')}"  # 移除字数限制
+                    f"{release.get('body', '')}"  # 无字数限制
                 )
-                
-                # 智能处理超长消息
-                self.send_telegram_message_safe(base_message)
+                self.send_telegram_message_safe(message)
                 
                 # 处理附件
                 anykernel_assets = [
@@ -130,7 +128,6 @@ class handler(BaseHTTPRequestHandler):
     
     def send_telegram_message_safe(self, text):
         """智能处理超长消息的分段发送"""
-        # 如果消息长度在Telegram限制内，直接发送
         if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
             return self.send_telegram_message(text)
         
@@ -198,26 +195,37 @@ class handler(BaseHTTPRequestHandler):
             return False
 
     def send_telegram_document(self, file_url, file_name):
-        """发送文件到Telegram"""
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
-        safe_name = self.safe_markdown(file_name)
-        
-        payload = {
-            'chat_id': CHAT_ID,
-            'document': file_url,
-            'caption': f"`{safe_name}`",
-            'parse_mode': 'Markdown',
-            'disable_notification': True
-        }
-        
+        """发送文件到Telegram - 修复版本"""
+        # 关键修复：使用 multipart/form-data 方式直接上传文件内容
         try:
-            response = requests.post(url, json=payload, timeout=20)
-            response.raise_for_status()
+            print(f"⬇️ 下载文件中: {file_name}")
+            
+            # 设置浏览器User-Agent避免GitHub拦截
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            file_response = requests.get(file_url, headers=headers, timeout=20)
+            file_response.raise_for_status()
+            
+            # 准备文件上传
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+            files = {'document': (file_name, file_response.content)}
+            safe_name = self.safe_markdown(file_name)
+            data = {
+                'chat_id': CHAT_ID,
+                'caption': f"`{safe_name}`",
+                'parse_mode': 'Markdown',
+                'disable_notification': True
+            }
+            
+            print(f"🚀 上传文件中: {file_name} ({len(file_response.content)//1024}KB)")
+            upload_response = requests.post(url, files=files, data=data, timeout=30)
+            upload_response.raise_for_status()
+            
             print(f"✅ 文件发送成功: {file_name}")
             return True
+            
         except requests.exceptions.RequestException as e:
             print(f"❌ 文件发送失败: {file_name} - {str(e)}")
-            if hasattr(e, 'response'):
+            if hasattr(e, 'response') and e.response:
                 print(f"📄 响应详情: {e.response.status_code} {e.response.text}")
             
             # 降级方案：发送下载链接

@@ -18,7 +18,6 @@ if not (SECRET_TOKEN and BOT_TOKEN and CHAT_ID):
 
 MAX_CONTENT_LENGTH = 1024 * 1024  # 1MB
 ANY_KERNEL_PATTERN = re.compile(r'any[\s_-]?kernel3?', re.IGNORECASE)
-TELEGRAM_API_DELAY = 1  # 文件发送间隔(秒)
 TELEGRAM_MAX_MESSAGE_LENGTH = 4000  # Telegram消息最大长度
 
 class handler(BaseHTTPRequestHandler):
@@ -75,47 +74,18 @@ class handler(BaseHTTPRequestHandler):
                 )
                 self.send_telegram_message_safe(message)
                 
-                # 处理附件
-                anykernel_assets = [
-                    asset for asset in assets 
-                    if asset.get('name') and ANY_KERNEL_PATTERN.search(asset['name'])
-                ]
+                # 查找匹配的附件 - 只取第一个匹配项
+                matched_asset = None
+                for asset in assets:
+                    if asset.get('name') and ANY_KERNEL_PATTERN.search(asset['name']):
+                        matched_asset = asset
+                        break
                 
-                print(f"🔍 发现{len(anykernel_assets)}个匹配附件")
-                
-                if anykernel_assets:
-                    small_files = []
-                    large_files = []
-                    
-                    for asset in anykernel_assets:
-                        asset_url = asset['browser_download_url']
-                        asset_name = asset['name']
-                        asset_size = asset.get('size')
-                        
-                        if asset_size and asset_size <= 20 * 1024 * 1024:  # 20MB限制
-                            small_files.append((asset_url, asset_name))
-                            print(f"📦 准备发送小文件: {asset_name}")
-                        else:
-                            size_desc = f"{asset_size/(1024*1024):.1f}MB" if asset_size else "大小未知"
-                            print(f"⚠️ 文件过大({size_desc}): {asset_name}")
-                            large_files.append(asset)
-                    
-                    # 同步发送小文件 (Vercel环境适配)
-                    for file_url, file_name in small_files:
-                        try:
-                            print(f"🚀 发送文件中: {file_name}")
-                            self.send_telegram_document(file_url, file_name)
-                            time.sleep(TELEGRAM_API_DELAY)  # 避免速率限制
-                        except Exception as e:
-                            print(f"❌ 文件发送失败: {file_name} - {str(e)}")
-                    
-                    # 处理大文件
-                    if large_files:
-                        large_files_msg = "📦 大文件下载:\n" + "\n".join(
-                            f"- [`{self.safe_markdown(f['name'])}`]({f['browser_download_url']})"
-                            for f in large_files
-                        )
-                        self.send_telegram_message_safe(large_files_msg)
+                if matched_asset:
+                    print(f"🔍 找到匹配附件: {matched_asset['name']}")
+                    self.process_single_asset(matched_asset)
+                else:
+                    print("ℹ️ 未找到匹配附件")
 
             self.send_response(200)
             self.end_headers()
@@ -125,6 +95,30 @@ class handler(BaseHTTPRequestHandler):
             print(f"❌ 处理错误: {str(e)}")
             traceback.print_exc()
             self.send_error(500, f"服务器内部错误: {str(e)}")
+    
+    def process_single_asset(self, asset):
+        """处理单个匹配的附件"""
+        asset_url = asset['browser_download_url']
+        asset_name = asset['name']
+        asset_size = asset.get('size')
+        
+        # 检查文件大小是否在限制范围内
+        if asset_size and asset_size <= 20 * 1024 * 1024:  # 20MB限制
+            print(f"📦 准备发送文件: {asset_name}")
+            try:
+                self.send_telegram_document(asset_url, asset_name)
+            except Exception as e:
+                print(f"❌ 文件发送失败: {asset_name} - {str(e)}")
+        else:
+            size_desc = f"{asset_size/(1024*1024):.1f}MB" if asset_size else "大小未知"
+            print(f"⚠️ 文件过大({size_desc}): {asset_name}")
+            
+            # 发送大文件下载链接
+            large_file_msg = (
+                f"📦 大文件下载:\n"
+                f"- [`{self.safe_markdown(asset_name)}`]({asset_url})"
+            )
+            self.send_telegram_message_safe(large_file_msg)
     
     def send_telegram_message_safe(self, text):
         """智能处理超长消息的分段发送"""
@@ -195,20 +189,36 @@ class handler(BaseHTTPRequestHandler):
             return False
 
     def send_telegram_document(self, file_url, file_name):
-        """发送文件到Telegram - 修复版本"""
-        # 关键修复：使用 multipart/form-data 方式直接上传文件内容
+        """
+        发送文件到Telegram - 核心实现
+        步骤：
+        1. 下载文件内容到内存
+        2. 上传到Telegram
+        3. 确保内存及时释放
+        """
+        safe_name = self.safe_markdown(file_name)
+        
         try:
             print(f"⬇️ 下载文件中: {file_name}")
             
             # 设置浏览器User-Agent避免GitHub拦截
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-            file_response = requests.get(file_url, headers=headers, timeout=20)
-            file_response.raise_for_status()
             
-            # 准备文件上传
+            # 下载文件内容
+            response = requests.get(file_url, headers=headers, timeout=20)
+            response.raise_for_status()
+            
+            # 检查文件大小
+            file_size = len(response.content)
+            if file_size > 20 * 1024 * 1024:  # 20MB
+                raise ValueError(f"文件大小超过20MB限制: {file_size/(1024*1024):.1f}MB")
+            
+            file_size_kb = file_size // 1024
+            print(f"📥 下载完成: {file_name} ({file_size_kb}KB)")
+            
+            # 准备上传到Telegram
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
-            files = {'document': (file_name, file_response.content)}
-            safe_name = self.safe_markdown(file_name)
+            files = {'document': (file_name, response.content)}
             data = {
                 'chat_id': CHAT_ID,
                 'caption': f"`{safe_name}`",
@@ -216,7 +226,7 @@ class handler(BaseHTTPRequestHandler):
                 'disable_notification': True
             }
             
-            print(f"🚀 上传文件中: {file_name} ({len(file_response.content)//1024}KB)")
+            print(f"🚀 上传文件中: {file_name}")
             upload_response = requests.post(url, files=files, data=data, timeout=30)
             upload_response.raise_for_status()
             
@@ -235,3 +245,19 @@ class handler(BaseHTTPRequestHandler):
                 f"[下载链接]({file_url})"
             )
             return self.send_telegram_message(fallback_msg)
+        
+        except Exception as e:
+            print(f"❌ 文件处理错误: {file_name} - {str(e)}")
+            
+            # 发送错误通知
+            error_msg = (
+                f"⚠️ 文件处理失败: {file_name}\n"
+                f"错误: {str(e)}\n"
+                f"[原始下载链接]({file_url})"
+            )
+            return self.send_telegram_message(error_msg)
+        
+        finally:
+            # 确保资源释放
+            if 'response' in locals():
+                response.close()

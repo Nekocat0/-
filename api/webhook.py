@@ -7,11 +7,14 @@ import requests
 import re
 import time
 import traceback
+import threading
+import urllib.parse
 
 # 环境变量检查
 SECRET_TOKEN = os.environ.get('GITHUB_WEBHOOK_SECRET')
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+VERCEL_URL = os.environ.get('VERCEL_URL', '')  # 获取Vercel部署的URL
 
 if not (SECRET_TOKEN and BOT_TOKEN and CHAT_ID):
     raise RuntimeError("关键环境变量缺失或为空值")
@@ -22,6 +25,7 @@ ANY_KERNEL_PATTERN = re.compile(r'any.*kernel', re.IGNORECASE)
 TELEGRAM_MAX_MESSAGE_LENGTH = 4000  # Telegram消息最大长度
 MAX_RETRY_ATTEMPTS = 3  # 最大重试次数
 RETRY_DELAY = 2  # 重试间隔（秒）
+RECHECK_DELAY = 60  # 重启检查延迟（秒）
 
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -118,10 +122,25 @@ class handler(BaseHTTPRequestHandler):
                         "1. 附件尚未完成上传（GitHub延迟）\n"
                         "2. 附件名称不符合模式\n"
                         "3. 发布未包含内核刷机包\n\n"
-                        "请检查GitHub发布页面：\n"
-                        f"[{release['tag_name']} 发布页面]({release['html_url']})"
+                        f"将在 {RECHECK_DELAY} 秒后自动重试检查..."
                     )
                     self.send_telegram_message(no_asset_msg)
+                    
+                    # 安排延迟重启检查（如果配置了VERCEL_URL）
+                    if VERCEL_URL:
+                        print(f"⏰ 安排 {RECHECK_DELAY} 秒后重启检查...")
+                        repo_full_name = repo['full_name']
+                        release_id = release['id']
+                        tag_name = release['tag_name']
+                        
+                        # 启动后台线程进行延迟检查
+                        threading.Thread(
+                            target=self.delayed_recheck,
+                            args=(repo_full_name, release_id, tag_name),
+                            daemon=True
+                        ).start()
+                    else:
+                        print("⚠️ 未配置VERCEL_URL，无法进行延迟重启检查")
 
             self.send_response(200)
             self.end_headers()
@@ -131,6 +150,60 @@ class handler(BaseHTTPRequestHandler):
             print(f"❌ 处理错误: {str(e)}")
             traceback.print_exc()
             self.send_error(500, f"服务器内部错误: {str(e)}")
+    
+    def delayed_recheck(self, repo_full_name, release_id, tag_name):
+        """延迟后重启检查附件"""
+        print(f"⏳ 等待 {RECHECK_DELAY} 秒后重启检查...")
+        time.sleep(RECHECK_DELAY)
+        
+        print(f"🔄 重启检查: {repo_full_name} v{tag_name} (ID: {release_id})")
+        
+        try:
+            # 获取最新的release信息
+            api_url = f"https://api.github.com/repos/{repo_full_name}/releases/{release_id}"
+            headers = {'Accept': 'application/vnd.github.v3+json'}
+            response = requests.get(api_url, headers=headers, timeout=10)
+            response.raise_for_status()
+            release = response.json()
+            
+            # 检查附件
+            matched_asset = None
+            for asset in release.get('assets', []):
+                asset_name = asset.get('name', '')
+                if asset_name and ANY_KERNEL_PATTERN.search(asset_name):
+                    print(f"🎯 重启检查中发现匹配附件: {asset_name}")
+                    matched_asset = asset
+                    break
+            
+            if matched_asset:
+                # 处理找到的附件
+                self.process_single_asset(matched_asset)
+                
+                # 发送成功通知
+                success_msg = (
+                    f"✅ 重启检查成功找到附件\n\n"
+                    f"仓库: {repo_full_name}\n"
+                    f"版本: {tag_name}\n"
+                    f"附件: {matched_asset['name']}\n"
+                    f"下载: {matched_asset['browser_download_url']}"
+                )
+                self.send_telegram_message(success_msg)
+            else:
+                print("ℹ️ 重启检查后仍未找到匹配附件")
+                # 发送最终失败通知
+                fail_msg = (
+                    f"⚠️ 重启检查后仍未找到附件\n\n"
+                    f"仓库: {repo_full_name}\n"
+                    f"版本: {tag_name}\n"
+                    f"请手动检查发布页面: {release['html_url']}"
+                )
+                self.send_telegram_message(fail_msg)
+                
+        except Exception as e:
+            error_msg = f"❌ 重启检查失败: {str(e)}"
+            print(error_msg)
+            traceback.print_exc()
+            self.send_telegram_message(f"⚠️ 重启检查失败: {self.safe_markdown(str(e))}")
     
     def process_single_asset(self, asset):
         """处理单个匹配的附件"""
@@ -147,9 +220,9 @@ class handler(BaseHTTPRequestHandler):
         if asset_size and asset_size <= 20 * 1024 * 1024:  # 20MB限制
             print(f"📦 准备发送文件: {asset_name}")
             try:
-                # 使用简单描述而不是文件名
+                # 使用安全处理后的原始文件名
                 description = "内核刷机包"
-                self.send_telegram_document(asset_url, description)
+                self.send_telegram_document(asset_url, description, asset_name)
             except Exception as e:
                 print(f"❌ 文件发送失败: {asset_name} - {str(e)}")
                 
@@ -239,9 +312,9 @@ class handler(BaseHTTPRequestHandler):
                 print(f"📄 响应详情: {e.response.status_code} {e.response.text}")
             return False
 
-    def send_telegram_document(self, file_url, description):
+    def send_telegram_document(self, file_url, description, asset_name):
         """
-        发送文件到Telegram - 使用简单描述
+        发送文件到Telegram - 使用原始文件名
         """
         try:
             print(f"⬇️ 下载文件中...")
@@ -261,9 +334,13 @@ class handler(BaseHTTPRequestHandler):
             file_size_kb = file_size // 1024
             print(f"📥 下载完成 ({file_size_kb}KB)")
             
+            # 安全处理文件名：只保留安全字符
+            safe_filename = re.sub(r'[^\w\d.-]', '_', asset_name)
+            print(f"📤 使用安全文件名: {safe_filename}")
+            
             # 准备上传到Telegram
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
-            files = {'document': ('kernel_flash.zip', response.content)}  # 固定文件名
+            files = {'document': (safe_filename, response.content)}  # 使用原始文件名（安全处理）
             data = {
                 'chat_id': CHAT_ID,
                 'caption': f"**{description}**",  # 使用简单描述

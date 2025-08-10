@@ -1,4 +1,5 @@
-from http.server import BaseHTTPRequestHandler
+# webhook.py
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import hmac
 import hashlib
@@ -7,220 +8,266 @@ import requests
 import re
 import time
 import traceback
+import io
 
-# 环境变量检查
+# -------------------------
+# 配置与环境变量
+# -------------------------
 SECRET_TOKEN = os.environ.get('GITHUB_WEBHOOK_SECRET')
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+# 可选：用于通过 GitHub API 查询与下载 assets（推荐在 Vercel 环境变量中设置）
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')  # 可以使用 GITHUB_TOKEN 或 PAT
 
 if not (SECRET_TOKEN and BOT_TOKEN and CHAT_ID):
-    raise RuntimeError("关键环境变量缺失或为空值")
+    raise RuntimeError("关键环境变量缺失: 请设置 GITHUB_WEBHOOK_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
 
-MAX_CONTENT_LENGTH = 1024 * 1024  # 1MB
-# 增强匹配模式 - 允许 "any" 和 "kernel" 之间有任意字符
+# 常量
+MAX_CONTENT_LENGTH = 1024 * 1024  # 1MB for webhook payload
 ANY_KERNEL_PATTERN = re.compile(r'any.*kernel', re.IGNORECASE)
-TELEGRAM_MAX_MESSAGE_LENGTH = 4000  # Telegram消息最大长度
-MAX_RETRY_ATTEMPTS = 3  # 最大重试次数
-RETRY_DELAY = 2  # 重试间隔（秒）
+TELEGRAM_MAX_MESSAGE_LENGTH = 4000
+MAX_RETRY_ATTEMPTS = 4
+RETRY_DELAY = 2  # seconds
+TELEGRAM_MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20MB
 
+# GitHub API headers (用于 fetch assets / 下载)
+GITHUB_API_HEADERS = {
+    'User-Agent': 'github-webhook-to-telegram',
+    'Accept': 'application/vnd.github+json'
+}
+if GITHUB_TOKEN:
+    GITHUB_API_HEADERS['Authorization'] = f'token {GITHUB_TOKEN}'
+
+
+# -------------------------
+# Handler
+# -------------------------
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        # 增强路径验证 (支持/api/webhook和/webhook)
         valid_paths = ["/api/webhook", "/webhook"]
         if self.path not in valid_paths:
-            error_msg = f"路径无效: {self.path}。期望路径: {', '.join(valid_paths)}"
-            self.send_error(404, error_msg)
-            print(f"❌ {error_msg}")
+            self.send_error(404, f"路径无效: {self.path}")
+            print(f"❌ 非法路径请求: {self.path}")
             return
 
-        # 安全验证
+        # 验证 X-Hub-Signature-256
         signature_header = self.headers.get('X-Hub-Signature-256')
         if not signature_header:
             self.send_error(403, "缺少签名")
+            print("❌ 缺少 X-Hub-Signature-256 头")
             return
 
-        # 内容长度检查
-        content_length = int(self.headers['Content-Length'])
+        # 检查长度
+        try:
+            content_length = int(self.headers.get('Content-Length', '0'))
+        except:
+            content_length = 0
         if content_length > MAX_CONTENT_LENGTH:
             self.send_error(413, "请求体过大")
+            print("❌ webhook payload 过大")
             return
-            
-        body = self.rfile.read(content_length)
-        expected_signature = 'sha256=' + hmac.new(
-            SECRET_TOKEN.encode(), body, hashlib.sha256
-        ).hexdigest()
 
+        body = self.rfile.read(content_length)
+        expected_signature = 'sha256=' + hmac.new(SECRET_TOKEN.encode(), body, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(signature_header, expected_signature):
-            print(f"❌ 签名无效. 收到: {signature_header} 预期: {expected_signature}")
+            print(f"❌ 签名无效. 收到: {signature_header}  预期: {expected_signature}")
             self.send_error(403, "签名无效")
             return
 
         try:
             data = json.loads(body)
-            
-            if data.get('action') == 'published':
-                repo = data['repository']
-                release = data['release']
-                sender = data['sender']
-                
-                print(f"📦 收到Release事件: {repo['full_name']} v{release['tag_name']}")
-                
-                # 发送基础通知
-                message = (
-                    f"🔔 **新版本发布通知**\n\n"
-                    f"📦 仓库: [{repo['full_name']}]({repo['html_url']})\n"
-                    f"🏷 版本: [{release['tag_name']}]({release['html_url']}) - {release.get('name', '')}\n"
-                    f"👤 发布者: [{sender['login']}]({sender['html_url']})\n"
-                    f"📅 发布时间: {release['published_at']}\n\n"
-                    f"{release.get('body', '')}"  # 无字数限制
-                )
-                self.send_telegram_message_safe(message)
-                
-                # 智能附件检测（带重试机制）
-                matched_asset = None
-                assets = []
-                
-                for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
-                    # 获取当前附件列表
-                    assets = release.get('assets', [])
-                    print(f"🔄 附件检测尝试 #{attempt}/{MAX_RETRY_ATTEMPTS}: 发现 {len(assets)} 个附件")
-                    
-                    # 打印所有附件详情（调试用）
-                    for i, asset in enumerate(assets):
-                        asset_name = asset.get('name', '')
-                        asset_size = asset.get('size', 0)
-                        print(f"  附件{i+1}: {asset_name} - {asset_size//1024}KB" if asset_size else f"  附件{i+1}: {asset_name} - 大小未知")
-                    
-                    # 查找匹配的附件 - 只取第一个匹配项
-                    for asset in assets:
-                        asset_name = asset.get('name', '')
-                        if asset_name and ANY_KERNEL_PATTERN.search(asset_name):
-                            print(f"🎯 匹配到附件: {asset_name}")
-                            matched_asset = asset
-                            break
-                    
-                    if matched_asset:
-                        break  # 找到附件，退出重试循环
-                    
-                    # 如果还有重试机会，等待后重试
-                    if attempt < MAX_RETRY_ATTEMPTS:
-                        print(f"⏳ 未找到匹配附件，等待 {RETRY_DELAY} 秒后重试...")
-                        time.sleep(RETRY_DELAY)
-                
+        except Exception as e:
+            print(f"❌ 无法解析 JSON: {e}")
+            self.send_error(400, "无效的 JSON")
+            return
+
+        try:
+            action = data.get('action')
+            if action != 'published':
+                # 仅关心 release published 事件（可根据需要拓展）
+                print(f"ℹ️ 忽略 action: {action}")
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'OK')
+                return
+
+            repo = data.get('repository', {})
+            release = data.get('release', {})
+            sender = data.get('sender', {})
+
+            repo_full = repo.get('full_name', 'unknown/repo')
+            tag_name = release.get('tag_name', 'unknown')
+            print(f"📦 收到 Release published: {repo_full} {tag_name}")
+
+            # 构建通知消息并发送（支持分段）
+            message = (
+                f"🔔 **新版本发布通知**\n\n"
+                f"📦 仓库: [{repo_full}]({repo.get('html_url', '')})\n"
+                f"🏷 版本: [{tag_name}]({release.get('html_url','')}) - {release.get('name','')}\n"
+                f"👤 发布者: [{sender.get('login','')}]({sender.get('html_url','')})\n"
+                f"📅 发布时间: {release.get('published_at','')}\n\n"
+                f"{release.get('body','')}"
+            )
+            self.send_telegram_message_safe(message)
+
+            # 查找匹配的 asset（先用 payload，再用 API 主动查询）
+            matched_asset = None
+            assets = []
+
+            for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+                assets = release.get('assets', []) or []
+                print(f"🔄 (尝试 #{attempt}) payload 中发现 {len(assets)} 个 asset")
+
+                # 如果 payload 里没有 asset，或未找到匹配项，主动通过 GitHub API 再查一次 release
+                if not assets:
+                    print("🔎 payload 未含 assets 或为空，尝试使用 GitHub API 查询 release assets...")
+                    api_assets = fetch_release_assets(repo_full, release_id=release.get('id'), tag_name=tag_name)
+                    if api_assets is not None:
+                        assets = api_assets
+                        print(f"🔁 从 API 查询到 {len(assets)} 个 asset")
+                    else:
+                        print("⚠️ API 查询失败或无返回")
+
+                # 打印调试信息
+                for i, a in enumerate(assets):
+                    an = a.get('name', '')
+                    sz = a.get('size', 0)
+                    print(f"  asset[{i}]: {an} ({sz//1024 if sz else '未知'} KB)")
+
+                # 找到第一个匹配 ANY_KERNEL_PATTERN 的 asset
+                for a in assets:
+                    an = a.get('name', '')
+                    if an and ANY_KERNEL_PATTERN.search(an):
+                        matched_asset = a
+                        print(f"🎯 匹配到 asset: {an}")
+                        break
+
                 if matched_asset:
-                    self.process_single_asset(matched_asset)
-                else:
-                    print("ℹ️ 最终未找到匹配附件")
-                    # 添加提示消息
-                    no_asset_msg = (
-                        "⚠️ 未检测到内核刷机包附件\n\n"
-                        "这可能是由于：\n"
-                        "1. 附件尚未完成上传（GitHub延迟）\n"
-                        "2. 附件名称不符合模式\n"
-                        "3. 发布未包含内核刷机包\n\n"
-                        "请检查GitHub发布页面：\n"
-                        f"[{release['tag_name']} 发布页面]({release['html_url']})"
-                    )
-                    self.send_telegram_message(no_asset_msg)
+                    break
+
+                if attempt < MAX_RETRY_ATTEMPTS:
+                    print(f"⏳ 未找到匹配 asset，等待 {RETRY_DELAY}s 后重试...")
+                    time.sleep(RETRY_DELAY)
+
+            # 处理匹配到的 asset
+            if matched_asset:
+                self.process_single_asset(matched_asset, repo_full, release)
+            else:
+                print("ℹ️ 最终未找到匹配附件")
+                no_asset_msg = (
+                    "⚠️ 未检测到内核刷机包附件\n\n"
+                    "这可能是由于：\n"
+                    "1. 附件尚未完成上传（GitHub 延迟）\n"
+                    "2. 附件名称不符合模式\n"
+                    "3. 发布未包含内核刷机包\n\n"
+                    "请检查 GitHub 发布页面：\n"
+                    f"[{tag_name} 发布页面]({release.get('html_url','')})"
+                )
+                self.send_telegram_message(no_asset_msg)
 
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b'OK')
 
         except Exception as e:
-            print(f"❌ 处理错误: {str(e)}")
+            print(f"❌ 处理错误: {e}")
             traceback.print_exc()
-            self.send_error(500, f"服务器内部错误: {str(e)}")
-    
-    def process_single_asset(self, asset):
-        """处理单个匹配的附件"""
-        asset_url = asset['browser_download_url']
-        asset_name = asset['name']
+            self.send_error(500, f"服务器内部错误: {e}")
+
+    # -------------------------
+    # 处理单个 asset
+    # -------------------------
+    def process_single_asset(self, asset, repo_full, release):
+        asset_name = asset.get('name')
         asset_size = asset.get('size')
-        
-        # 详细日志
-        print(f"🔍 处理附件: {asset_name}")
-        print(f"  大小: {asset_size//1024}KB" if asset_size else "  大小: 未知")
-        print(f"  下载链接: {asset_url}")
-        
-        # 检查文件大小是否在限制范围内
-        if asset_size and asset_size <= 20 * 1024 * 1024:  # 20MB限制
-            print(f"📦 准备发送文件: {asset_name}")
+        asset_browser_url = asset.get('browser_download_url')
+        asset_api_url = asset.get('url')  # API 下载地址： /repos/:owner/:repo/releases/assets/:asset_id
+
+        print(f"🔍 处理匹配附件: {asset_name}")
+        if asset_size:
+            print(f"  大小: {asset_size/(1024*1024):.2f} MB")
+        print(f"  浏览器下载链接: {asset_browser_url}")
+        print(f"  API 链接: {asset_api_url}")
+
+        # 尝试通过 API 下载（优先），若失败回退到 browser_download_url
+        try:
+            content_bytes = download_asset_content(asset)
+        except Exception as e:
+            print(f"❌ 通过 API 下载 asset 失败: {e}")
+            content_bytes = None
+
+        # 如果用 API 下载失败但 browser_download_url 存在，则尝试直接下载
+        if content_bytes is None and asset_browser_url:
             try:
-                # 使用简单描述而不是文件名
-                description = "内核刷机包"
-                self.send_telegram_document(asset_url, description)
+                print("⬇️ 回退到 browser_download_url 下载（可能需要公有仓库或 token）")
+                r = requests.get(asset_browser_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30)
+                r.raise_for_status()
+                content_bytes = r.content
+                r.close()
             except Exception as e:
-                print(f"❌ 文件发送失败: {asset_name} - {str(e)}")
-                
-                # 发送备用下载链接（仍然包含文件名）
-                fallback_msg = (
-                    f"⚠️ 文件上传失败，请手动下载:\n"
-                    f"`{self.safe_markdown(asset_name)}`\n"
-                    f"[下载链接]({asset_url})"
-                )
-                self.send_telegram_message(fallback_msg)
-        else:
-            size_desc = f"{asset_size/(1024*1024):.1f}MB" if asset_size else "大小未知"
-            print(f"⚠️ 文件过大({size_desc}): {asset_name}")
-            
-            # 发送大文件下载链接（包含简单描述）
-            large_file_msg = (
-                f"📦 大文件下载 (内核刷机包):\n"
-                f"[点击下载]({asset_url})"
-            )
-            self.send_telegram_message(large_file_msg)
-    
+                print(f"❌ 回退下载失败: {e}")
+                content_bytes = None
+
+        # 检查大小并上传到 Telegram
+        if content_bytes:
+            size_b = len(content_bytes)
+            if size_b <= TELEGRAM_MAX_UPLOAD_BYTES:
+                try:
+                    description = f"内核刷机包: {release.get('tag_name','')}"
+                    ok = send_telegram_document_bytes(asset_name, content_bytes, description)
+                    if ok:
+                        print("✅ asset 已成功上传到 Telegram")
+                        return
+                    else:
+                        print("⚠️ 上传到 Telegram 返回失败")
+                except Exception as e:
+                    print(f"❌ 上传到 Telegram 发生异常: {e}")
+            else:
+                print(f"⚠️ 文件过大，无法通过 Telegram 上传: {size_b/(1024*1024):.2f}MB")
+
+        # 如果到这里仍然没有成功，发送 fallback 消息包含下载链接
+        fallback_msg = (
+            f"⚠️ 无法自动上传附件: `{self.safe_markdown(asset_name or '未知')}`\n\n"
+            f"请手动下载：\n{asset_browser_url or asset.get('url')}"
+        )
+        self.send_telegram_message(fallback_msg)
+
+    # -------------------------
+    # 文本发送与分段
+    # -------------------------
     def send_telegram_message_safe(self, text):
-        """智能处理超长消息的分段发送"""
         if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
             return self.send_telegram_message(text)
-        
-        print(f"⚠️ 消息过长({len(text)}字符)，将分段发送...")
-        
-        # 分段发送策略
+        print(f"⚠️ 文本过长({len(text)}字符)，将分段发送")
         messages = []
-        current_message = ""
-        
-        # 按行分割保持段落结构
-        for line in text.split('\n'):
-            # 如果当前行加入后不超过限制，添加该行
-            if len(current_message) + len(line) + 1 <= TELEGRAM_MAX_MESSAGE_LENGTH:
-                current_message += line + "\n"
+        current = ""
+        for line in text.splitlines():
+            if len(current) + len(line) + 1 <= TELEGRAM_MAX_MESSAGE_LENGTH:
+                current += line + "\n"
             else:
-                # 保存当前消息段
-                if current_message:
-                    messages.append(current_message.strip())
-                
-                # 如果单行就超过限制，进行强制分割
+                if current:
+                    messages.append(current.strip())
                 if len(line) > TELEGRAM_MAX_MESSAGE_LENGTH:
+                    # 强制切分
                     chunks = [line[i:i+TELEGRAM_MAX_MESSAGE_LENGTH] for i in range(0, len(line), TELEGRAM_MAX_MESSAGE_LENGTH)]
                     messages.extend(chunks)
-                    current_message = ""
+                    current = ""
                 else:
-                    current_message = line + "\n"
-        
-        # 添加最后一段
-        if current_message.strip():
-            messages.append(current_message.strip())
-        
-        # 发送所有分段
+                    current = line + "\n"
+        if current.strip():
+            messages.append(current.strip())
         for i, msg in enumerate(messages):
             prefix = f"📄 消息分段 ({i+1}/{len(messages)})\n\n" if len(messages) > 1 else ""
             self.send_telegram_message(prefix + msg)
-            time.sleep(0.5)  # 短暂延迟避免速率限制
+            time.sleep(0.3)
+        return True
 
     def safe_markdown(self, text):
-        """安全处理Markdown特殊字符"""
-        return (
-            text.replace('`', "'")
-                .replace('*', '×')
-                .replace('[', '(')
-                .replace(']', ')')
-        )
-    
+        if not text:
+            return ""
+        return text.replace('`', "'").replace('*', '×').replace('[', '(').replace(']', ')')
+
     def send_telegram_message(self, text):
-        """发送文本消息到Telegram"""
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         payload = {
             'chat_id': CHAT_ID,
@@ -229,66 +276,112 @@ class handler(BaseHTTPRequestHandler):
             'disable_web_page_preview': True
         }
         try:
-            response = requests.post(url, json=payload, timeout=10)
-            response.raise_for_status()
-            print(f"✅ 消息发送成功 ({len(text)}字符)")
+            r = requests.post(url, json=payload, timeout=10)
+            r.raise_for_status()
+            print(f"✅ 发送消息成功 ({len(text)} 字符)")
             return True
         except requests.exceptions.RequestException as e:
-            print(f"❌ 消息发送失败: {str(e)}")
-            if hasattr(e, 'response'):
-                print(f"📄 响应详情: {e.response.status_code} {e.response.text}")
+            print(f"❌ 发送消息失败: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"  响应: {e.response.status_code} {e.response.text}")
             return False
 
-    def send_telegram_document(self, file_url, description):
-        """
-        发送文件到Telegram - 使用简单描述
-        """
-        try:
-            print(f"⬇️ 下载文件中...")
-            
-            # 设置浏览器User-Agent避免GitHub拦截
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-            
-            # 下载文件内容
-            response = requests.get(file_url, headers=headers, timeout=20)
-            response.raise_for_status()
-            
-            # 检查文件大小
-            file_size = len(response.content)
-            if file_size > 20 * 1024 * 1024:  # 20MB
-                raise ValueError(f"文件大小超过20MB限制: {file_size/(1024*1024):.1f}MB")
-            
-            file_size_kb = file_size // 1024
-            print(f"📥 下载完成 ({file_size_kb}KB)")
-            
-            # 准备上传到Telegram
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
-            files = {'document': ('kernel_flash.zip', response.content)}  # 固定文件名
-            data = {
-                'chat_id': CHAT_ID,
-                'caption': f"**{description}**",  # 使用简单描述
-                'parse_mode': 'Markdown',
-                'disable_notification': True
-            }
-            
-            print(f"🚀 上传文件中...")
-            upload_response = requests.post(url, files=files, data=data, timeout=30)
-            upload_response.raise_for_status()
-            
-            print(f"✅ 文件发送成功")
-            return True
-            
-        except requests.exceptions.RequestException as e:
-            print(f"❌ 文件发送失败 - {str(e)}")
-            if hasattr(e, 'response') and e.response:
-                print(f"📄 响应详情: {e.response.status_code} {e.response.text}")
-            raise  # 抛出异常让上层处理
-        
-        except Exception as e:
-            print(f"❌ 文件处理错误 - {str(e)}")
-            raise  # 抛出异常让上层处理
-        
-        finally:
-            # 确保资源释放
-            if 'response' in locals():
-                response.close()
+
+# -------------------------
+# 辅助函数（类外，以便复用）
+# -------------------------
+def fetch_release_assets(repo_full_name, release_id=None, tag_name=None):
+    """
+    使用 GitHub API 获取 release 的 assets 列表。
+    优先使用 release_id，如果没有则使用 tag_name。
+    返回 assets 列表（或空列表），出错时返回 None。
+    """
+    try:
+        if release_id:
+            url = f"https://api.github.com/repos/{repo_full_name}/releases/{release_id}"
+        elif tag_name:
+            url = f"https://api.github.com/repos/{repo_full_name}/releases/tags/{tag_name}"
+        else:
+            print("❌ fetch_release_assets: 既没有 release_id 也没有 tag_name")
+            return None
+
+        resp = requests.get(url, headers=GITHUB_API_HEADERS, timeout=10)
+        resp.raise_for_status()
+        rel = resp.json()
+        return rel.get('assets', [])
+    except Exception as e:
+        print(f"❌ fetch_release_assets 异常: {e}")
+        return None
+
+
+def download_asset_content(asset):
+    """
+    优先使用 asset['url']（API 地址）并加 Accept: application/octet-stream 来下载二进制内容
+    如果使用 API 下载需要 Authorization（如果仓库是私有或 token 必要）
+    成功返回 bytes，失败抛出异常
+    """
+    asset_api_url = asset.get('url')
+    asset_browser_url = asset.get('browser_download_url')
+    headers = GITHUB_API_HEADERS.copy()
+    # 当使用 assets API 直接获取二进制时需 Accept header
+    headers['Accept'] = 'application/octet-stream'
+    try:
+        if asset_api_url:
+            print(f"⬇️ 使用 API 下载 asset: {asset_api_url}")
+            resp = requests.get(asset_api_url, headers=headers, timeout=60, stream=True)
+            # GitHub 会在此返回二进制流（需要 Authorization 若为私有）
+            resp.raise_for_status()
+            content = resp.content
+            resp.close()
+            return content
+        elif asset_browser_url:
+            print(f"⬇️ 使用 browser_download_url 下载 asset: {asset_browser_url}")
+            resp = requests.get(asset_browser_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=60)
+            resp.raise_for_status()
+            content = resp.content
+            resp.close()
+            return content
+        else:
+            raise RuntimeError("asset 不包含可下载的 url")
+    except Exception as e:
+        raise
+
+
+def send_telegram_document_bytes(filename, content_bytes, caption):
+    """
+    把 bytes 内容作为文件上传到 Telegram
+    """
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+    files = {
+        'document': (filename or 'file.bin', content_bytes)
+    }
+    data = {
+        'chat_id': CHAT_ID,
+        'caption': f"**{caption}**" if caption else '',
+        'parse_mode': 'Markdown',
+        'disable_notification': True
+    }
+    try:
+        r = requests.post(url, files=files, data=data, timeout=60)
+        r.raise_for_status()
+        print("✅ sendDocument 成功")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"❌ sendDocument 失败: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"  响应: {e.response.status_code} {e.response.text}")
+        return False
+
+
+# -------------------------
+# 可选的本地测试/运行入口（在 Vercel/服务器上运行时可以注释或留空）
+# -------------------------
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', '8080'))
+    print(f"启动本地测试服务器: 0.0.0.0:{port}")
+    server = HTTPServer(('0.0.0.0', port), handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.server_close()
+        print("服务器已停止")

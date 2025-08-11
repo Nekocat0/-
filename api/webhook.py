@@ -23,7 +23,7 @@ if not (SECRET_TOKEN and BOT_TOKEN and CHAT_ID):
     raise RuntimeError("关键环境变量缺失: 请设置 GITHUB_WEBHOOK_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
 
 # 常量
-MAX_CONTENT_LENGTH = 10 * 1024 * 1024  # 10MB for webhook payload （防止超大）
+MAX_CONTENT_LENGTH = 1024 * 1024  # 1MB for webhook payload
 ANY_KERNEL_PATTERN = re.compile(r'any.*kernel', re.IGNORECASE)
 TELEGRAM_MAX_MESSAGE_LENGTH = 4000
 MAX_RETRY_ATTEMPTS = 4
@@ -97,7 +97,6 @@ class handler(BaseHTTPRequestHandler):
 
             repo_full = repo.get('full_name', 'unknown/repo')
             tag_name = release.get('tag_name', 'unknown')
-            release_id = release.get('id')
             print(f"📦 收到 Release published: {repo_full} {tag_name}")
 
             # 构建通知消息并发送（支持分段）
@@ -111,20 +110,23 @@ class handler(BaseHTTPRequestHandler):
             )
             self.send_telegram_message_safe(message)
 
-            # 关键改动：**不再读取 payload 中的 assets**，始终通过 GitHub API 查询 assets
+            # 查找匹配的 asset（先用 payload，再用 API 主动查询）
             matched_asset = None
-            assets = None
+            assets = []
 
             for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
-                print(f"🔄 (尝试 #{attempt}) 通过 GitHub API 查询 release assets...")
-                api_assets = fetch_release_assets(repo_full, release_id=release_id, tag_name=tag_name)
-                if api_assets is None:
-                    print("⚠️ API 查询失败或无返回")
-                    assets = []
-                else:
-                    assets = api_assets
+                assets = release.get('assets', []) or []
+                print(f"🔄 (尝试 #{attempt}) payload 中发现 {len(assets)} 个 asset")
 
-                print(f"🔁 从 API 查询到 {len(assets)} 个 asset")
+                # 如果 payload 里没有 asset，或未找到匹配项，主动通过 GitHub API 再查一次 release
+                if not assets:
+                    print("🔎 payload 未含 assets 或为空，尝试使用 GitHub API 查询 release assets...")
+                    api_assets = fetch_release_assets(repo_full, release_id=release.get('id'), tag_name=tag_name)
+                    if api_assets is not None:
+                        assets = api_assets
+                        print(f"🔁 从 API 查询到 {len(assets)} 个 asset")
+                    else:
+                        print("⚠️ API 查询失败或无返回")
 
                 # 打印调试信息
                 for i, a in enumerate(assets):
@@ -188,7 +190,6 @@ class handler(BaseHTTPRequestHandler):
         print(f"  API 链接: {asset_api_url}")
 
         # 尝试通过 API 下载（优先），若失败回退到 browser_download_url
-        content_bytes = None
         try:
             content_bytes = download_asset_content(asset)
         except Exception as e:
@@ -207,13 +208,12 @@ class handler(BaseHTTPRequestHandler):
                 print(f"❌ 回退下载失败: {e}")
                 content_bytes = None
 
-        # 检查大小并上传到 Telegram（并添加简单描述）
+        # 检查大小并上传到 Telegram
         if content_bytes:
             size_b = len(content_bytes)
             if size_b <= TELEGRAM_MAX_UPLOAD_BYTES:
                 try:
-                    # 简单描述：release tag + asset name
-                    description = f"{release.get('tag_name','')} 的附件：{asset_name}"
+                    description = f"内核刷机包: {release.get('tag_name','')}"
                     ok = send_telegram_document_bytes(asset_name, content_bytes, description)
                     if ok:
                         print("✅ asset 已成功上传到 Telegram")
@@ -329,6 +329,7 @@ def download_asset_content(asset):
         if asset_api_url:
             print(f"⬇️ 使用 API 下载 asset: {asset_api_url}")
             resp = requests.get(asset_api_url, headers=headers, timeout=60, stream=True)
+            # GitHub 会在此返回二进制流（需要 Authorization 若为私有）
             resp.raise_for_status()
             content = resp.content
             resp.close()
@@ -348,16 +349,15 @@ def download_asset_content(asset):
 
 def send_telegram_document_bytes(filename, content_bytes, caption):
     """
-    把 bytes 内容作为文件上传到 Telegram（caption 为简短描述）
+    把 bytes 内容作为文件上传到 Telegram
     """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
     files = {
         'document': (filename or 'file.bin', content_bytes)
     }
-    # caption 长度受 Telegram 限制（约 1024 字符），这里发送简单描述
     data = {
         'chat_id': CHAT_ID,
-        'caption': caption or '',
+        'caption': f"**{caption}**" if caption else '',
         'parse_mode': 'Markdown',
         'disable_notification': True
     }

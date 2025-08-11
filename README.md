@@ -5,7 +5,7 @@
 推送新Release的文字描述和发送Release附件（仅发送文件名包含“anykernel3”的文件）。
 
 ## 主要内容
-将[oppo_oneplus_realme_sm8650](https://github.com/Nekocat0/oppo_oplus_realme_sm8650)推送至Telegram
+将[oppo_oneplus_realme_sm8650](https://github.com/Nekocat0/oppo_oplus_realme_sm8650)新Release推送至Telegram
 
 ## ⚠️注意
 脚本内容均使用Chat GPT和DeepSeek R1生成，且仅限于本人使用。
